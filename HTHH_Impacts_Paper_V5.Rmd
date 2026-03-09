@@ -1,0 +1,697 @@
+---
+title: "HTHH Impacts analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+date: "2026-03-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+# ============================================================================
+# HTHH_Impacts_Paper_V5
+# ----------------------------------------------------------------------------
+
+# ---- 0) PROJECT PATHS (EDIT ONCE) ------------------------------------------
+paths <- list(
+  data_dir = ".",            # Fish_Data.xlsx, Benthic_Data.csv, Target_families.csv, Fishing_Pressure.csv
+  fits_dir = "fits",         # cached brms model .rds
+  fig_dir  = "figures"       # exported figures
+)
+
+dir.create(paths$fits_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(paths$fig_dir,  showWarnings = FALSE, recursive = TRUE)
+
+```
+
+
+```{r}
+# ---- 1) PACKAGES + OPTIONS -------------------------------------------------
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(lubridate)
+  library(geosphere)
+  library(ggplot2)
+  library(scales)
+  library(janitor)
+  library(brms)
+  library(bayesplot)
+  library(patchwork)
+  library(sf)
+  library(rnaturalearth)
+  library(ggspatial)
+  library(tidybayes)
+})
+
+options(mc.cores = parallel::detectCores())
+```
+
+
+```{r}
+# ---- 2) THEME + HELPERS ----------------------------------------------------
+base_family <- if (.Platform$OS.type == "windows") {
+  suppressWarnings(windowsFonts(sans = windowsFont("Arial")))
+  "sans"
+} else {
+  "sans"
+}
+
+theme_nature <- function(base_size = 6) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(family = base_family),
+      axis.title = element_text(size = base_size),
+      axis.text  = element_text(size = base_size),
+      axis.line  = element_line(linewidth = 0.4),
+      axis.ticks = element_line(linewidth = 0.4),
+      legend.title = element_text(size = base_size),
+      legend.text  = element_text(size = base_size),
+      legend.key.size = unit(3, "mm"),
+      plot.title = element_text(size = base_size + 1, face = "bold"),
+      plot.margin = margin(4, 4, 4, 4, unit = "mm")
+    )
+}
+
+fit_or_load_brm <- function(path, formula, data, family, prior,
+                            chains = 4, iter = 4000,
+                            control = list(adapt_delta = 0.95, max_treedepth = 15),
+                            seed = 123) {
+  if (file.exists(path)) {
+    readRDS(path)
+  } else {
+    fit <- brm(
+      formula = formula,
+      data = data,
+      family = family,
+      prior = prior,
+      chains = chains,
+      iter = iter,
+      control = control,
+      seed = seed
+    )
+    saveRDS(fit, path)
+    fit
+  }
+}
+
+summarise_epred <- function(pred, newdata) {
+  stopifnot(ncol(pred) == nrow(newdata))
+  newdata %>%
+    mutate(
+      pred_median = apply(pred, 2, median),
+      lower = apply(pred, 2, quantile, probs = 0.025),
+      upper = apply(pred, 2, quantile, probs = 0.975)
+    )
+}
+
+unscale <- function(x_sc, x_raw) x_sc * sd(x_raw, na.rm = TRUE) + mean(x_raw, na.rm = TRUE)
+
+export_fig <- function(fig, filename_base, width_mm, height_mm, dpi = 600) {
+  ggsave(
+    filename = file.path(paths$fig_dir, paste0(filename_base, ".pdf")),
+    plot = fig,
+    width = width_mm, height = height_mm, units = "mm",
+    device = cairo_pdf
+  )
+  ggsave(
+    filename = file.path(paths$fig_dir, paste0(filename_base, ".png")),
+    plot = fig,
+    width = width_mm, height = height_mm, units = "mm",
+    dpi = dpi, bg = "white"
+  )
+  invisible(TRUE)
+}
+```
+
+
+```{r}
+# ---- 3) READ RAW DATA ------------------------------------------------------
+Fish    <- read_excel(file.path(paths$data_dir, "Fish_Data.xlsx"))
+Benthic <- read_csv(file.path(paths$data_dir, "Benthic_Data.csv"), show_col_types = FALSE)
+Target_families <- read_csv(file.path(paths$data_dir, "Target_families.csv"), show_col_types = FALSE)
+fp <- read_csv(file.path(paths$data_dir, "Fishing_Pressure.csv"),
+               col_types = cols(Lat = col_double(), Long = col_double(), FP.null = col_double()))
+```
+
+
+```{r}
+# ---- 4) BENTHIC: CLEAN → TRANSECT % COVER ---------------------------------
+Benthic_clean <- Benthic %>%
+  select(site_name, site_country_region, survey_title, survey_transect_number,
+         `survey_start_date (UTC)`, point_machine_classification,
+         point_machine_group_code, point_machine_benthic_code) %>%
+  mutate(survey_year = year(ymd_hms(`survey_start_date (UTC)`)))
+
+transect_group <- Benthic_clean %>%
+  group_by(site_name, site_country_region, survey_title,
+           survey_transect_number, survey_year, point_machine_group_code) %>%
+  summarise(n_points = n(), .groups = "drop") %>%
+  group_by(site_name, site_country_region, survey_title, survey_transect_number, survey_year) %>%
+  mutate(percent_cover = 100 * n_points / sum(n_points)) %>%
+  ungroup()
+
+transect_group_wide <- transect_group %>%
+  mutate(point_machine_group_code = na_if(point_machine_group_code, "")) %>%
+  filter(!is.na(point_machine_group_code)) %>%
+  select(site_name, site_country_region, survey_title, survey_transect_number,
+         survey_year, point_machine_group_code, percent_cover) %>%
+  pivot_wider(names_from = point_machine_group_code,
+              values_from = percent_cover,
+              values_fill = 0) %>%
+  rowwise() %>%
+  mutate(total_percent_cover = sum(c_across(-c(site_name, site_country_region,
+                                               survey_title, survey_transect_number,
+                                               survey_year)),
+                                   na.rm = TRUE)) %>%
+  ungroup()
+```
+
+
+
+```{r}
+# ---- 5) FISH: TRANSECT METRICS --------------------------------------------
+Fish_transect <- Fish %>%
+  mutate(
+    is_target = `Fish family` %in% Target_families$Family,
+    is_target_gt15 = is_target & Size > 15
+  ) %>%
+  group_by(
+    Country, Site, Latitude, Longitude, Exposure,
+    `Reef slope`, `Reef type`, `Reef zone`,
+    Year, Depth,
+    `Management name`, `Management secondary name`,
+    `Management year established`, `Management size`, `Management rules`,
+    `Transect number`, Observers
+  ) %>%
+  summarise(
+    total_biomass = sum(`Biomass kg/ha`, na.rm = TRUE),
+    target_biomass = sum(`Biomass kg/ha`[is_target], na.rm = TRUE),
+    target_gt15_biomass = sum(`Biomass kg/ha`[is_target_gt15], na.rm = TRUE),
+    species_diversity = n_distinct(`Fish taxon`),
+    avg_trophic_level = mean(`Trophic level`, na.rm = TRUE),
+    avg_vulnerability = mean(Vulnerability, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+# ---- 6) MERGE BENTHIC + FISH ----------------------------------------------
+transect_full <- transect_group_wide %>%
+  left_join(Fish_transect,
+            by = c("site_name" = "Site",
+                   "survey_transect_number" = "Transect number",
+                   "survey_year" = "Year"))
+```
+
+
+```{r}
+# ---- 7) ADD FISHING PRESSURE (ROUND LAT/LON TO 4 dp) ----------------------
+fp_key <- fp %>%
+  transmute(lat4 = round(Lat, 4), lon4 = round(Long, 4), fp_null = FP.null) %>%
+  distinct(lat4, lon4, .keep_all = TRUE)
+
+transect_full <- transect_full %>%
+  mutate(lat4 = round(Latitude, 4), lon4 = round(Longitude, 4)) %>%
+  left_join(fp_key, by = c("lat4", "lon4"))
+```
+
+
+```{r}
+# ---- 8) CLEAN NAMES + MANAGEMENT FIXES -------------------------------------
+transect_full <- transect_full %>%
+  mutate(
+    pre_post = case_when(
+      survey_year < 2022 ~ "pre",
+      survey_year > 2022 ~ "post",
+      TRUE ~ NA_character_
+    ),
+    `Management secondary name` = case_when(
+      `Management secondary name` %in% c("Fish Habitat Reserve (FHR)", "Fish Habitat Reserve") ~ "Fish Habitat Reserve",
+      TRUE ~ `Management secondary name`
+    )
+  ) %>%
+  clean_names() %>%
+  mutate(
+    management_secondary_name = case_when(
+      management_name %in% c("Holopeka SMA", "Faleloa SMA", "Koulo SMA") ~ "Special Management Area",
+      management_name == "Faleloa FHR" ~ "Fish Habitat Reserve",
+      TRUE ~ management_secondary_name
+    ),
+    management_year_established = case_when(
+      management_name %in% c("Holopeka SMA", "Faleloa SMA", "Faleloa FHR", "Koulo SMA") ~ 2017,
+      TRUE ~ management_year_established
+    )
+  )
+```
+
+
+```{r}
+# ---- 9) DISTANCE FROM EPICENTRE -------------------------------------------
+ref_lat <- -20.544359
+ref_lon <- -175.390260
+
+transect_full <- transect_full %>%
+  mutate(
+    distance_km = distHaversine(c(ref_lon, ref_lat), cbind(longitude, latitude)) / 1000
+  )
+```
+
+
+```{r}
+# ---- 10) FILTER: ONLY SITES WITH BOTH PRE & POST ---------------------------
+sites_with_both <- transect_full %>%
+  filter(!is.na(pre_post)) %>%
+  group_by(site_name) %>%
+  filter(all(c("pre", "post") %in% pre_post)) %>%
+  ungroup()
+```
+
+
+```{r}
+# ---- 11) TRANSECT CHANGE DATA ---------------------------------------------
+transect_covariates <- sites_with_both %>%
+  group_by(site_name, survey_transect_number) %>%
+  summarise(
+    mean_depth = mean(depth, na.rm = TRUE),
+    distance_km = mean(distance_km, na.rm = TRUE),
+    latitude = first(latitude),
+    longitude = first(longitude),
+    site_country_region = first(site_country_region),
+    .groups = "drop"
+  )
+
+transect_prepost <- sites_with_both %>%
+  group_by(site_name, survey_transect_number, site_country_region, pre_post) %>%
+  summarise(
+    mean_coral = mean(hard_coral, na.rm = TRUE),
+    mean_biomass = mean(total_biomass, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+transect_change <- transect_prepost %>%
+  pivot_wider(names_from = pre_post, values_from = c(mean_coral, mean_biomass)) %>%
+  mutate(
+    coral_change = mean_coral_post - mean_coral_pre,
+    biomass_change = mean_biomass_post - mean_biomass_pre
+  ) %>%
+  left_join(transect_covariates, by = c("site_name", "survey_transect_number"))
+```
+
+
+```{r}
+# ---- 12) MODEL DATASETS (SCALED) -------------------------------------------
+sites_with_both_sc <- sites_with_both %>%
+  mutate(
+    pre_post = factor(pre_post, levels = c("pre", "post")),
+    distance_sc = scale(distance_km)[, 1],
+    depth_sc    = scale(depth)[, 1],
+    coral_prop  = pmin(pmax(hard_coral / 100, 0.001), 0.999),
+    log_biomass = log1p(total_biomass),
+    target_biomass_log1p = log1p(target_biomass),
+    fp_prop = pmin(pmax(fp_null / 100, 0.001), 0.999),
+    fp_sc = scale(qlogis(fp_prop))[, 1]
+  )
+
+transect_change_sc <- transect_change %>%
+  mutate(
+    mean_depth_sc = scale(mean_depth)[, 1],
+    distance_sc   = scale(distance_km)[, 1]
+  )
+```
+
+
+```{r}
+# ---- 13) SIMPLE DISTRIBUTION FIGURES --------------------------------------
+Benthic_violin <- ggplot(sites_with_both_sc, aes(pre_post, hard_coral, fill = pre_post)) +
+  geom_violin(alpha = 0.7, trim = FALSE) +
+  geom_jitter(shape = 21, color = "black", stroke = 0.25, width = 0.15,
+              size = 1, alpha = 0.20) +
+  scale_x_discrete(labels = c(pre = "Pre-Eruption", post = "Post-Eruption")) +
+  scale_fill_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
+  labs(x = "Time period", y = "Hard coral cover (%)") +
+  theme_nature()
+
+trgtbm_violin <- ggplot(sites_with_both_sc, aes(pre_post, target_biomass, fill = pre_post)) +
+  geom_violin(alpha = 0.7, trim = FALSE) +
+  geom_jitter(shape = 21, color = "black", stroke = 0.25, width = 0.15,
+              size = 1, alpha = 0.20) +
+  scale_x_discrete(labels = c(pre = "Pre-Eruption", post = "Post-Eruption")) +
+  scale_fill_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
+  labs(x = "Time period", y = "Target species biomass (kg/ha)") +
+  theme_nature()
+```
+
+
+
+```{r}
+# ---- 14) MODELS: CORAL (BETA) + CORAL CHANGE (GAUSSIAN SPLINE) ------------
+##CORAL MODEL
+coral_priors <- c(
+  prior(normal(0, 1), class = "b"),
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(exponential(1), class = "sd")
+)
+
+coral_model_prepost <- fit_or_load_brm(
+  path = file.path(paths$fits_dir, "coral_model_prepost.rds"),
+  formula = coral_prop ~ pre_post * distance_sc + depth_sc + (1 + pre_post | site_name),
+  data = sites_with_both_sc,
+  family = Beta(),
+  prior = coral_priors,
+  iter = 4000,
+  control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+
+summary(coral_model_prepost)
+
+newdata_coral <- crossing(
+  distance_sc = seq(min(sites_with_both_sc$distance_sc, na.rm = TRUE),
+                    max(sites_with_both_sc$distance_sc, na.rm = TRUE), length.out = 100),
+  pre_post = factor(c("pre", "post"), levels = c("pre", "post"))
+) %>% mutate(depth_sc = mean(sites_with_both_sc$depth_sc, na.rm = TRUE))
+
+pred_coral <- posterior_epred(coral_model_prepost, newdata = newdata_coral, re_formula = NA)
+coral_pred <- summarise_epred(pred_coral, newdata_coral) %>%
+  mutate(distance_km = unscale(distance_sc, sites_with_both_sc$distance_km))
+
+coral_model_fig <- ggplot(coral_pred, aes(distance_km, pred_median, color = pre_post, fill = pre_post)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, color = NA) +
+  scale_y_continuous(limits = c(0, 0.25), labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
+  scale_fill_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
+  labs(x = "Distance from eruption (km)", y = "Predicted coral cover (%)") +
+  theme_nature()
+
+##CORAL CHANGE MODEL
+coral_change_priors <- c(
+  prior(normal(0, 0.5), class = "b"),
+  prior(normal(0, 2), class = "Intercept"),
+  prior(exponential(2), class = "sds"),
+  prior(exponential(2), class = "sd"),
+  prior(exponential(2), class = "sigma")
+)
+
+coral_change_model_spline <- fit_or_load_brm(
+  path = file.path(paths$fits_dir, "coral_change_model_spline.rds"),
+  formula = coral_change ~ s(distance_sc) + mean_depth_sc + (1 | site_name),
+  data = transect_change_sc,
+  family = gaussian(),
+  prior = coral_change_priors,
+  iter = 6000,
+  control = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+
+newdata_coralchg <- tibble(
+  distance_sc = seq(min(transect_change_sc$distance_sc, na.rm = TRUE),
+                    max(transect_change_sc$distance_sc, na.rm = TRUE), length.out = 200),
+  mean_depth_sc = mean(transect_change_sc$mean_depth_sc, na.rm = TRUE)
+)
+
+pred_coralchg <- posterior_epred(coral_change_model_spline, newdata = newdata_coralchg, re_formula = NA)
+coralchg_pred <- summarise_epred(pred_coralchg, newdata_coralchg) %>%
+  mutate(distance_km = unscale(distance_sc, transect_change_sc$distance_km))
+
+site_means_coral <- transect_change_sc %>%
+  group_by(site_name, site_country_region.x) %>%
+  summarise(distance_km = mean(distance_km, na.rm = TRUE),
+            coral_change = mean(coral_change, na.rm = TRUE), .groups = "drop")
+
+coral_change_model_fig <- ggplot(coralchg_pred, aes(distance_km, pred_median)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, fill = "grey70") +
+  geom_point(data = site_means_coral,
+             aes(x = distance_km, y = coral_change, color = factor(site_country_region.x,
+                                                                 levels = c("Vavau", "Haapai", "Tongatapu"))),
+             inherit.aes = FALSE, alpha = 0.3, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Vavau" = "#C9A227", "Haapai" = "#7B4FA3", "Tongatapu" = "#2A9D8F"),
+                     labels = c("Vavau" = "Vava'u", "Haapai" = "Ha'apai", "Tongatapu" = "Tongatapu"),
+                     name = "Island Group") +
+  labs(x = "Distance from eruption (km)", y = "Change in coral cover (%)") +
+  theme_nature()
+
+```
+
+```{r}
+# ---- 15) MANAGEMENT: No-take vs Open (ALL FHR ANALYSIS, WITH fp_sc) --------
+# Toggle: choose whether the time×management figure uses model predictions
+# TRUE  = posterior credible intervals from FPallFHR_model
+# FALSE = raw mean ± 1.96*SE on back-transformed biomass
+use_predicted_time_mgmt <- FALSE
+
+sites_allFHR <- sites_with_both_sc %>%
+  mutate(
+    management_secondary_name = case_when(
+      management_secondary_name %in% c("Open", "Special Management Area") ~ "Open",
+      management_secondary_name == "Fish Habitat Reserve" ~ "No-Take",
+      TRUE ~ management_secondary_name
+    ),
+    management_secondary_name = factor(management_secondary_name, levels = c("No-Take", "Open"))
+  )
+
+FPallFHR_model <- fit_or_load_brm(
+  path = file.path(paths$fits_dir, "FPallFHR_model.rds"),
+  formula = target_biomass_log1p ~ distance_sc * pre_post * management_secondary_name + depth_sc + fp_sc + (1 | site_name),
+  data = sites_allFHR,
+  family = gaussian(),
+  prior = bm_priors,
+  iter = 4000,
+  control = list(adapt_delta = 0.95, max_treedepth = 15)
+)
+
+summary(FPallFHR_model)
+
+# (A.1) Time × management Raw Data Plot
+.time_mgmt_raw <- function(df) {
+  df_plot <- df %>%
+    filter(management_secondary_name %in% c("No-Take", "Open")) %>%
+    mutate(
+      pre_post = factor(pre_post, levels = c("pre", "post"),
+                        labels = c("Pre-Eruption", "Post-Eruption")),
+      management_secondary_name = factor(management_secondary_name, levels = c("No-Take", "Open")),
+      biomass_bt = expm1(target_biomass_log1p)
+    )
+
+  sum_df <- df_plot %>%
+    group_by(management_secondary_name, pre_post) %>%
+    summarise(
+      mean_bt = mean(biomass_bt, na.rm = TRUE),
+      se_bt   = sd(biomass_bt, na.rm = TRUE) / sqrt(sum(!is.na(biomass_bt))),
+      lower   = mean_bt - 1.96 * se_bt,
+      upper   = mean_bt + 1.96 * se_bt,
+      .groups = "drop"
+    ) %>%
+    mutate(lower = pmax(lower, 0))
+
+  ggplot(sum_df,
+         aes(x = pre_post, y = mean_bt,
+             group = management_secondary_name,
+             color = management_secondary_name)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.10, linewidth = 0.6) +
+    geom_point(size = 1.6) +
+    geom_line(linewidth = 0.6) +
+    scale_color_manual(values = c("No-Take" = "#2E8B57", "Open" = "#1F5AA6"), name = "") +
+    labs(x = "Time period", y = "Target species biomass (kg/ha)") +
+    scale_y_continuous(trans = "sqrt") +
+    theme_nature(base_size = 5) +
+    theme(legend.position = c(0.80, 0.80))
+}
+
+# (A.2) Time × management Predcited Data Plot
+.time_mgmt_pred <- function(model, df) {
+  nd <- crossing(
+    pre_post = factor(c("pre", "post"), levels = c("pre", "post")),
+    management_secondary_name = factor(c("No-Take", "Open"), levels = c("No-Take", "Open"))
+  ) %>%
+    mutate(
+      distance_sc = mean(df$distance_sc, na.rm = TRUE),
+      depth_sc    = mean(df$depth_sc, na.rm = TRUE),
+      fp_sc       = mean(df$fp_sc, na.rm = TRUE)
+    )
+
+  p <- posterior_epred(model, newdata = nd, re_formula = NA)
+  p_bt <- expm1(p)
+
+  sum_df <- nd %>%
+    mutate(
+      mean_bt = apply(p_bt, 2, median),
+      lower   = apply(p_bt, 2, quantile, 0.025),
+      upper   = apply(p_bt, 2, quantile, 0.975),
+      pre_post = factor(pre_post, levels = c("pre", "post"),
+                        labels = c("Pre-Eruption", "Post-Eruption"))
+    ) %>%
+    mutate(lower = pmax(lower, 0))
+
+  ggplot(sum_df,
+         aes(x = pre_post, y = mean_bt,
+             group = management_secondary_name,
+             color = management_secondary_name)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.10, linewidth = 0.6) +
+    geom_point(size = 1.6) +
+    geom_line(linewidth = 0.6) +
+    scale_color_manual(values = c("No-Take" = "#2E8B57", "Open" = "#1F5AA6"), name = "") +
+    labs(x = "Time period", y = "Target species biomass (kg/ha)") +
+    scale_y_continuous(trans = "sqrt") +
+    theme_nature(base_size = 5) +
+    theme(legend.position = c(0.80, 0.80))
+}
+
+if (isTRUE(use_predicted_time_mgmt)) {
+  time_mgmt_fig <- .time_mgmt_pred(FPallFHR_model, sites_allFHR)
+} else {
+  time_mgmt_fig <- .time_mgmt_raw(sites_allFHR)
+}
+
+# (B) Management with Distance
+newdata_allFHR <- crossing(
+  distance_sc = seq(min(sites_allFHR$distance_sc, na.rm = TRUE),
+                    max(sites_allFHR$distance_sc, na.rm = TRUE), length.out = 100),
+  pre_post = factor(c("pre", "post"), levels = c("pre", "post")),
+  management_secondary_name = factor(c("No-Take", "Open"), levels = c("No-Take", "Open"))
+) %>% mutate(
+  depth_sc = mean(sites_allFHR$depth_sc, na.rm = TRUE),
+  fp_sc = mean(sites_allFHR$fp_sc, na.rm = TRUE)
+)
+
+pred_allFHR <- posterior_epred(FPallFHR_model, newdata = newdata_allFHR, re_formula = NA)
+allFHR_pred <- summarise_epred(pred_allFHR, newdata_allFHR) %>%
+  mutate(distance_km = unscale(distance_sc, sites_allFHR$distance_km))
+
+allFHR_fig <- ggplot(allFHR_pred, aes(x = distance_km, y = pred_median)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = pre_post), alpha = 0.15, color = NA) +
+  geom_line(aes(color = pre_post), linewidth = 0.6) +
+  geom_point(data = sites_allFHR,
+             aes(x = distance_km, y = target_biomass_log1p, color = pre_post, fill = pre_post),
+             inherit.aes = FALSE, shape = 21, size = 0.5, alpha = 0.3) +
+  scale_color_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"),
+                     labels = c(pre = "Pre-Eruption", post = "Post-Eruption"), name = "") +
+  scale_fill_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
+  coord_cartesian(ylim = c(3.5, 9)) +
+  labs(x = "Distance from eruption (km)", y = "log Target species biomass (kg/ha)") +
+  facet_grid(. ~ management_secondary_name,
+             labeller = labeller(management_secondary_name = c("No-Take" = "No-take", "Open" = "Open"))) +
+  theme_nature(base_size = 5) +
+  theme(
+    panel.spacing.x = unit(0.2, "cm"),
+    strip.text = element_text(size = 6),
+    axis.title = element_text(size = 6),
+    axis.text = element_text(size = 5),
+    legend.text = element_text(size = 6),
+    legend.position = c(0.85, 0.16)
+  )
+
+```
+
+
+```{r}
+# ---- 16) MAPS --------------------------------------------------------------
+# Epicentre + rings
+
+epic_lon <- -175.388031
+
+epic_lat <- -20.534010
+
+epic_sf <- st_as_sf(data.frame(name = "Epicentre", lon = epic_lon, lat = epic_lat),
+                    coords = c("lon", "lat"), crs = 4326)
+
+epic_utm <- st_transform(epic_sf, 32701)
+
+r_km <- seq(50, 250, by = 50)
+
+rings_sf <- do.call(rbind, lapply(seq_along(r_km), function(i) {
+  st_sf(r_km = r_km[i], geometry = st_geometry(st_buffer(epic_utm, dist = r_km[i] * 1000)))
+}))
+
+rings_sf <- st_transform(rings_sf, 4326)
+
+# Tonga outline
+tonga <- rnaturalearth::ne_countries(scale = "medium", country = "Tonga", returnclass = "sf")
+fmt_w <- function(x) paste0(abs(x), "° W")
+fmt_s <- function(y) paste0(abs(y), "° S")
+
+# Overall sites map
+sites_sf <- st_as_sf(transect_change, coords = c("longitude", "latitude"), crs = 4326)
+
+map_fig <- ggplot() +
+  geom_sf(data = tonga, fill = "#1F4D1F", color = "grey35", linewidth = 0.3) +
+  geom_sf(data = rings_sf, fill = NA, color = "#F4A996", alpha = 0.5,
+          linewidth = 0.4, linetype = "dashed") +
+  geom_sf(data = epic_sf, shape = 24, size = 3.2, fill = "black", color = "black") +
+  annotate("text", x = epic_lon, y = epic_lat - 0.08, label = "Epicentre",
+           size = 2.6, family = base_family) +
+  geom_sf(data = sites_sf, shape = 21, fill = "#F2D16B", color = "black",
+          size = 2.5, alpha = 0.4) +
+  coord_sf(xlim = c(-175.7, -173.9), ylim = c(-21.5, -18.5), expand = FALSE) +
+  scale_x_continuous(labels = fmt_w) +
+  scale_y_continuous(labels = fmt_s) +
+  labs(title = "Kingdom of Tonga", x = "Longitude", y = "Latitude") +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+    panel.grid.minor = element_line(color = "grey95", linewidth = 0.2),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    plot.title = element_text(hjust = 0, face = "plain")
+  ) +
+  annotation_scale(location = "br", width_hint = 0.22, text_cex = 0.7) +
+  annotation_north_arrow(location = "br", which_north = "true",
+                         style = north_arrow_fancy_orienteering,
+                         height = unit(1.0, "cm"), width = unit(1.0, "cm"))
+```
+
+
+```{r}
+# ---- 17) COMBINED FIGURES --------------------------------------------------
+combined_benthic_fig <-
+  (Benthic_violin | coral_model_fig | coral_change_model_fig) +
+  plot_annotation(tag_levels = "A")
+
+combined_FHR_fig <-
+  (trgtbm_violin | time_mgmt_fig) /
+  allFHR_fig +
+  plot_layout(heights = c(1, 1.2)) +
+  plot_annotation(tag_levels = "A")
+
+combined_benthic_fig
+combined_FHR_fig
+
+```
+
+
+```{r}
+# ---- 18) EXPORTS -----------------------------------------------------------
+export_fig(map_fig, "map_fig", width_mm = 90, height_mm = 60)
+export_fig(combined_benthic_fig, "Benthic_combined_doublecol", width_mm = 180, height_mm = 180)
+export_fig(allFHR_fig, "allFHR_fig", width_mm = 180, height_mm = 110)
+export_fig(time_mgmt_fig, "time_mgmt_fig", width_mm = 90, height_mm = 90)
+export_fig(combined_FHR_fig, "combined_FHR_fig", width_mm = 160, height_mm = 120)
+
+# Export as double-column width (Nature ~180 mm)
+ggsave(
+  "combined_FHR_fig.pdf",
+  plot   = combined_FHR_fig,
+  width  = 90 / 25.4,   # double column width
+  height = 90 / 25.4,   # adjust if you want a flatter/taller layout
+  device = cairo_pdf
+)
+
+# Export as double-column width PNG (Nature ~180 mm)
+ggsave(
+  filename = "combined_FHR_fig.png",
+  plot     = combined_FHR_fig,
+  width    = 90 / 25.4,   # double column width (inches)
+  height   = 90 / 25.4,    # adjust as needed
+  units    = "in",
+  dpi      = 300,
+  bg       = "white"
+)
+```
