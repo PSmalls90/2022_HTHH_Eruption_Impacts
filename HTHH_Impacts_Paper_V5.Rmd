@@ -335,6 +335,7 @@ Benthic_violin <- ggplot(sites_with_both_sc, aes(pre_post, hard_coral, fill = pr
   geom_violin(alpha = 0.7, trim = FALSE) +
   geom_jitter(shape = 21, color = "black", stroke = 0.25, width = 0.15,
               size = 1, alpha = 0.20) +
+  scale_y_continuous(limits = c(0, NA))+
   scale_x_discrete(labels = c(pre = "Pre-Eruption", post = "Post-Eruption")) +
   scale_fill_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
   labs(x = "Time period", y = "Hard coral cover (%)") +
@@ -344,12 +345,12 @@ trgtbm_violin <- ggplot(sites_with_both_sc, aes(pre_post, target_biomass, fill =
   geom_violin(alpha = 0.7, trim = FALSE) +
   geom_jitter(shape = 21, color = "black", stroke = 0.25, width = 0.15,
               size = 1, alpha = 0.20) +
+  scale_y_continuous(limits = c(0, NA))+
   scale_x_discrete(labels = c(pre = "Pre-Eruption", post = "Post-Eruption")) +
   scale_fill_manual(values = c(pre = "#1F5AA6", post = "#E07A5F"), guide = "none") +
   labs(x = "Time period", y = "Target species biomass (kg/ha)") +
   theme_nature()
 ```
-
 
 
 ```{r}
@@ -362,8 +363,8 @@ coral_priors <- c(
 )
 
 coral_model_prepost <- fit_or_load_brm(
-  path = file.path(paths$fits_dir, "coral_model_prepost.rds"),
-  formula = coral_prop ~ pre_post * distance_sc + depth_sc + (1 + pre_post | site_name),
+  path = file.path(paths$fits_dir, "coral_model_PrepostxMan.rds"),
+  formula = coral_prop ~ distance_sc * pre_post * management_secondary_name + depth_sc + (1 + pre_post | site_name),
   data = sites_with_both_sc,
   family = Beta(),
   prior = coral_priors,
@@ -373,10 +374,15 @@ coral_model_prepost <- fit_or_load_brm(
 
 summary(coral_model_prepost)
 
+sites_with_both_sc <- sites_with_both_sc |>
+  mutate(management_secondary_name = factor(management_secondary_name))
+
 newdata_coral <- crossing(
   distance_sc = seq(min(sites_with_both_sc$distance_sc, na.rm = TRUE),
                     max(sites_with_both_sc$distance_sc, na.rm = TRUE), length.out = 100),
-  pre_post = factor(c("pre", "post"), levels = c("pre", "post"))
+  pre_post = factor(c("pre", "post"), levels = c("pre", "post")),
+  management_secondary_name =
+    levels(sites_with_both_sc$management_secondary_name)
 ) %>% mutate(depth_sc = mean(sites_with_both_sc$depth_sc, na.rm = TRUE))
 
 pred_coral <- posterior_epred(coral_model_prepost, newdata = newdata_coral, re_formula = NA)
@@ -449,6 +455,12 @@ coral_change_model_fig <- ggplot(coralchg_pred, aes(distance_km, pred_median)) +
 # FALSE = raw mean ± 1.96*SE on back-transformed biomass
 use_predicted_time_mgmt <- FALSE
 
+bm_priors <- c(
+  prior(normal(0, 1), class = "b"),
+  prior(student_t(3, 0, 2.5), class = "Intercept"),
+  prior(exponential(1), class = "sd")
+)
+
 sites_allFHR <- sites_with_both_sc %>%
   mutate(
     management_secondary_name = case_when(
@@ -460,8 +472,8 @@ sites_allFHR <- sites_with_both_sc %>%
   )
 
 FPallFHR_model <- fit_or_load_brm(
-  path = file.path(paths$fits_dir, "FPallFHR_model.rds"),
-  formula = target_biomass_log1p ~ distance_sc * pre_post * management_secondary_name + depth_sc + fp_sc + (1 | site_name),
+  path = file.path(paths$fits_dir, "FPallFHR_model_wcoral.rds"),
+  formula = target_biomass_log1p ~ distance_sc * pre_post * management_secondary_name + coral_prop + depth_sc + fp_sc + (1 | site_name),
   data = sites_allFHR,
   family = gaussian(),
   prior = bm_priors,
@@ -500,7 +512,7 @@ summary(FPallFHR_model)
     geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.10, linewidth = 0.6) +
     geom_point(size = 1.6) +
     geom_line(linewidth = 0.6) +
-    scale_color_manual(values = c("No-Take" = "#2E8B57", "Open" = "#1F5AA6"), name = "") +
+    scale_color_manual(values = c("No-Take" = "#2E8B57", "Open" = "#1F5AA6"), labels = c("No-Take" = "No‑Take", "Open" = "Fished"),name = "") +
     labs(x = "Time period", y = "Target species biomass (kg/ha)") +
     scale_y_continuous(trans = "sqrt") +
     theme_nature(base_size = 5) +
@@ -553,15 +565,18 @@ if (isTRUE(use_predicted_time_mgmt)) {
 }
 
 # (B) Management with Distance
+
 newdata_allFHR <- crossing(
   distance_sc = seq(min(sites_allFHR$distance_sc, na.rm = TRUE),
                     max(sites_allFHR$distance_sc, na.rm = TRUE), length.out = 100),
   pre_post = factor(c("pre", "post"), levels = c("pre", "post")),
-  management_secondary_name = factor(c("No-Take", "Open"), levels = c("No-Take", "Open"))
+  management_secondary_name = factor(c("No-Take", "Open"),
+                                     levels = c("No-Take", "Open"))
 ) %>% mutate(
-  depth_sc = mean(sites_allFHR$depth_sc, na.rm = TRUE),
-  fp_sc = mean(sites_allFHR$fp_sc, na.rm = TRUE)
-)
+  depth_sc  = mean(sites_allFHR$depth_sc, na.rm = TRUE),
+  fp_sc     = mean(sites_allFHR$fp_sc, na.rm = TRUE),
+  coral_prop = mean(sites_allFHR$coral_prop, na.rm = TRUE))
+
 
 pred_allFHR <- posterior_epred(FPallFHR_model, newdata = newdata_allFHR, re_formula = NA)
 allFHR_pred <- summarise_epred(pred_allFHR, newdata_allFHR) %>%
@@ -579,7 +594,7 @@ allFHR_fig <- ggplot(allFHR_pred, aes(x = distance_km, y = pred_median)) +
   coord_cartesian(ylim = c(3.5, 9)) +
   labs(x = "Distance from eruption (km)", y = "log Target species biomass (kg/ha)") +
   facet_grid(. ~ management_secondary_name,
-             labeller = labeller(management_secondary_name = c("No-Take" = "No-take", "Open" = "Open"))) +
+             labeller = labeller(management_secondary_name = c("No-Take" = "No-take", "Open" = "Fished"))) +
   theme_nature(base_size = 5) +
   theme(
     panel.spacing.x = unit(0.2, "cm"),
@@ -591,7 +606,6 @@ allFHR_fig <- ggplot(allFHR_pred, aes(x = distance_km, y = pred_median)) +
   )
 
 ```
-
 
 ```{r}
 # ---- 16) MAPS --------------------------------------------------------------
@@ -658,8 +672,11 @@ combined_benthic_fig <-
 combined_FHR_fig <-
   (trgtbm_violin | time_mgmt_fig) /
   allFHR_fig +
-  plot_layout(heights = c(1, 1.2)) +
-  plot_annotation(tag_levels = "A")
+  plot_layout(heights = c(1, 1.2), guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme_nature(base_size = 6) &
+  theme(plot.margin = margin(2, 2, 2, 2, "mm"))
+
 
 combined_benthic_fig
 combined_FHR_fig
@@ -669,17 +686,32 @@ combined_FHR_fig
 
 ```{r}
 # ---- 18) EXPORTS -----------------------------------------------------------
-export_fig(map_fig, "map_fig", width_mm = 90, height_mm = 60)
-export_fig(combined_benthic_fig, "Benthic_combined_doublecol", width_mm = 180, height_mm = 180)
-export_fig(allFHR_fig, "allFHR_fig", width_mm = 180, height_mm = 110)
-export_fig(time_mgmt_fig, "time_mgmt_fig", width_mm = 90, height_mm = 90)
-export_fig(combined_FHR_fig, "combined_FHR_fig", width_mm = 160, height_mm = 120)
+# Export as double-column width (Nature ~180 mm)
+ggsave(
+  "combined_benthic_fig.pdf",
+  plot   = combined_benthic_fig,
+  width  = 180 / 25.4,   # double column width
+  height = 55 / 25.4,   # adjust if you want a flatter/taller layout
+  device = cairo_pdf
+)
+
+# Export as double-column width PNG (Nature ~180 mm)
+ggsave(
+  filename = "combined_benthic_fig.png",
+  plot     = combined_benthic_fig,
+  width    = 180 / 25.4,   # double column width (inches)
+  height   = 55 / 25.4,    # adjust as needed
+  units    = "in",
+  dpi      = 300,
+  bg       = "white"
+)
+
 
 # Export as double-column width (Nature ~180 mm)
 ggsave(
   "combined_FHR_fig.pdf",
   plot   = combined_FHR_fig,
-  width  = 90 / 25.4,   # double column width
+  width  = 120 / 25.4,   # double column width
   height = 90 / 25.4,   # adjust if you want a flatter/taller layout
   device = cairo_pdf
 )
@@ -688,7 +720,7 @@ ggsave(
 ggsave(
   filename = "combined_FHR_fig.png",
   plot     = combined_FHR_fig,
-  width    = 90 / 25.4,   # double column width (inches)
+  width    = 120 / 25.4,   # double column width (inches)
   height   = 90 / 25.4,    # adjust as needed
   units    = "in",
   dpi      = 300,
