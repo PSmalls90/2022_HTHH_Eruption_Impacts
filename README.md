@@ -41,5 +41,10 @@ No non-standard hardware is required.
 ## Reproducing Results
 Running all scripts will reproduce the main analyses and figures presented in the manuscript.
 
-##License
+## License
 MIT License
+
+## Data
+A subset of the data (100 randomly sampled rows from each dataset) is provided to demonstrate the workflow.
+
+
