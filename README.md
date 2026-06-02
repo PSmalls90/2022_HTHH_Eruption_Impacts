@@ -19,11 +19,22 @@ All data processing, statistical analyses, and figure generation are implemented
 - R version: 4.5.2 or later  
 - Operating systems: macOS, Linux, Windows  
 - Key R packages:
-  - tidyverse
-  - lme4 / glmmTMB
-  - brms
-  - ggplot2
-  - sf (if spatial)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(lubridate)
+  library(geosphere)
+  library(ggplot2)
+  library(scales)
+  library(janitor)
+  library(brms)
+  library(bayesplot)
+  library(patchwork)
+  library(sf)
+  library(rnaturalearth)
+  library(ggspatial)
+  library(tidybayes)
   
 All dependencies are listed in script headers.
 
