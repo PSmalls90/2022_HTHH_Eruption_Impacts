@@ -37,3 +37,9 @@ No non-standard hardware is required.
 2. Clone this repository:
    ```bash
    git clone https://github.com/PSmalls90/2022_HTHH_Eruption_Impacts
+
+## Reproducing Results
+Running all scripts will reproduce the main analyses and figures presented in the manuscript.
+
+##License
+MIT License
